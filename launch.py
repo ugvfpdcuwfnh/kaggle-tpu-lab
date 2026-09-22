@@ -71,7 +71,12 @@ PHASE_TEXT = {
 
 
 def kaggle(*args, capture=True):
-    cmd = [sys.executable, "-m", "kaggle", *args]
+    # Prefer the installed CLI executable.  This matters when launch.py is
+    # started with a different Python interpreter than the one that contains
+    # the Kaggle package (the CLI may still be correctly installed on PATH).
+    kaggle_bin = shutil.which("kaggle")
+    cmd = ([kaggle_bin, *args] if kaggle_bin
+           else [sys.executable, "-m", "kaggle", *args])
     r = subprocess.run(cmd, capture_output=capture, text=True)
     return r
 
@@ -254,7 +259,12 @@ def render_event(ev):
         print(f"  API key  : {ev['api_key']}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
-        base = ev["endpoint"] if ev["endpoint"].endswith("/v1") else ev["endpoint"] + "/v1"
+        endpoint = ev.get("endpoint")
+        if not endpoint:
+            print("  public URL : UNAVAILABLE (cloudflared tunnel failed)")
+            print("  The model is healthy only inside the Kaggle kernel; restart with the latest launcher to retry the tunnel.")
+            return
+        base = endpoint if endpoint.endswith("/v1") else endpoint + "/v1"
         print(f"""
 Try it:
   curl {base}/chat/completions -H "Authorization: Bearer $KEY" \\
@@ -386,8 +396,8 @@ def cmd_status(args):
 def cmd_stop(args):
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
-    p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+    # Use the same authenticated Kaggle CLI selection as status/serve.
+    p = kaggle("kernels", "delete", "-y", st["kernel"])
     say((p.stdout + p.stderr).strip() or "done")
 
 

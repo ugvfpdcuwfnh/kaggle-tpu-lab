@@ -807,25 +807,37 @@ for _ in range(60):  # cloudflared download runs in the background from step 1
         break
     time.sleep(2)
 if CLOUDFLARED.exists():
-    tunnel = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
-                               "--no-autoupdate", "--protocol", "quic"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Kaggle often blocks UDP/QUIC egress. Try the default protocol first,
+    # then HTTP/2, instead of pinning the tunnel to QUIC and losing the public
+    # endpoint while the local model continues to serve.
     pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-    lines = []
+    for protocol in (None, "http2", "quic"):
+        lines = []
+        cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
+               "--no-autoupdate"]
+        if protocol:
+            cmd += ["--protocol", protocol]
+        tunnel = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
 
-    def pump_cf():
-        for line in tunnel.stdout:
-            lines.append(line.rstrip())
-            _raw.write(f"[cloudflared] {line}")
-    threading.Thread(target=pump_cf, daemon=True).start()
-    deadline = time.time() + 180
-    while time.time() < deadline and url is None:
-        for ln in lines:
-            m = pat.search(ln)
-            if m:
-                url = m.group(0).rstrip("/")
-                break
-        time.sleep(1)
+        def pump_cf(proc=tunnel, output=lines):
+            for line in proc.stdout:
+                output.append(line.rstrip())
+                _raw.write(f"[cloudflared] {line}")
+        threading.Thread(target=pump_cf, daemon=True).start()
+        deadline = time.time() + 60
+        while time.time() < deadline and url is None and tunnel.poll() is None:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    url = m.group(0).rstrip("/")
+                    break
+            time.sleep(1)
+        if url:
+            break
+        if tunnel.poll() is None:
+            tunnel.terminate()
+            tunnel.wait(timeout=10)
 if url:
     log(f"   your endpoint will be  {url}/v1")
     log("   (not live yet — it answers 502 until the READY banner below)")
