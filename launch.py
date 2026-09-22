@@ -247,6 +247,15 @@ def render_event(ev):
                 "compile cold (add ~10 min).")
     elif phase == "tunnel-url":
         say(f"Endpoint URL reserved: {ev.get('endpoint')}  (not live yet — wait for the banner)")
+    elif phase == "tunnel-failed":
+        say("Public tunnel failed; the model may still be healthy inside Kaggle.")
+        attempts = ev.get("attempts") or []
+        for attempt in attempts:
+            protocol = attempt.get("protocol", "unknown")
+            rc = attempt.get("returncode")
+            say(f"cloudflared {protocol}: returncode={rc}")
+            for line in attempt.get("output_tail") or []:
+                print(f"  {line}")
     elif phase == "serving":
         say(f"Server is HEALTHY after {ev.get('startup_secs', 0) // 60} min.")
     elif phase == "benchmark":
