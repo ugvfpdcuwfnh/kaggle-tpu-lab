@@ -1153,29 +1153,48 @@ url = None
 TUN = [None]
 
 
-def start_tunnel(attempts=3, wait_s=90):
-    """A cloudflared quick tunnel -> its public URL, or None. Registration sometimes fails or hangs (seen in our runs):
-    an attempt that prints no URL within `wait_s` is killed and retried."""
+def start_tunnel(attempts=3, wait_s=60):
+    """Start a quick tunnel, trying protocols that work in restricted Kaggle networks.
+
+    A registration attempt that prints no URL within ``wait_s`` is terminated
+    before the next protocol/attempt is tried.
+    """
     pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    protocols = (None, "http2", "quic")
     for i in range(attempts):
-        tun = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        q = queue.Queue()
-        threading.Thread(target=lambda: [q.put(l) for l in iter(tun.stdout.readline, "")], daemon=True).start()
-        t0 = time.time()
-        while time.time() - t0 < wait_s:
-            try:
-                line = q.get(timeout=5)
-            except queue.Empty:
-                if tun.poll() is not None:
-                    break
-                continue
-            m = pat.search(line)
-            if m:
-                TUN[0] = tun
-                return m.group(0)
-        tun.kill()
-        log(f"   tunnel attempt {i + 1}/{attempts}: no URL within {wait_s} s (cloudflared rc {tun.poll()}); retrying")
+        for protocol in protocols:
+            cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
+                   "--no-autoupdate"]
+            if protocol:
+                cmd += ["--protocol", protocol]
+            tun = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+            q = queue.Queue()
+            threading.Thread(
+                target=lambda proc=tun: [q.put(line) for line in iter(proc.stdout.readline, "")],
+                daemon=True,
+            ).start()
+            t0 = time.time()
+            while time.time() - t0 < wait_s:
+                try:
+                    line = q.get(timeout=5)
+                except queue.Empty:
+                    if tun.poll() is not None:
+                        break
+                    continue
+                m = pat.search(line)
+                if m:
+                    TUN[0] = tun
+                    return m.group(0)
+            if tun.poll() is None:
+                tun.terminate()
+                try:
+                    tun.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    tun.kill()
+                    tun.wait()
+            log(f"   tunnel attempt {i + 1}/{attempts} ({protocol or 'default'}): "
+                f"no URL within {wait_s} s (cloudflared rc {tun.returncode}); retrying")
     return None
 
 
@@ -1209,7 +1228,9 @@ if CFG["tunnel"]:
         threading.Thread(target=tunnel_probe, args=(url,), daemon=True).start()
     else:
         publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
-STATE["url"] = url or f"http://127.0.0.1:{PORT}"
+# Do not advertise the loopback fallback as a public endpoint. The launcher
+# treats a null endpoint as a tunnel failure and reports it explicitly.
+STATE["url"] = url
 
 # ----------------------------------------------------------------------------- 6. ready, self-test, keep alive
 banner(6, "Ready", "self-test, then serving")
@@ -1240,17 +1261,22 @@ except Exception as e:  # noqa: BLE001
     import traceback; log("   self-test failed:", traceback.format_exc()[-800:])
 
 endpoint = STATE["url"]
+local_endpoint = f"http://127.0.0.1:{PORT}"
 log("")
 log("#" * 70)
 log(f"#  READY — the server is live ({elapsed()} after start)")
-log(f"#  ENDPOINT : {endpoint}   (OpenAI at /v1, Anthropic at /v1/messages)")
+log(f"#  ENDPOINT : {endpoint or local_endpoint + ' (public tunnel failed)'}   "
+    "(OpenAI at /v1, Anthropic at /v1/messages)")
 log(f"#  API KEY  : {API_KEY}")
 log(f"#  MODEL    : {MODEL}   (context {CFG['max_len']}, up to {MAX_STREAMS} streams)")
 log("#" * 70)
-log("#  Claude Code:")
-log(f"#    ANTHROPIC_BASE_URL={endpoint} ANTHROPIC_AUTH_TOKEN={API_KEY} ANTHROPIC_MODEL={MODEL} \\")
-log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CFG['max_len']} claude")
-log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
+if endpoint:
+    log("#  Claude Code:")
+    log(f"#    ANTHROPIC_BASE_URL={endpoint} ANTHROPIC_AUTH_TOKEN={API_KEY} ANTHROPIC_MODEL={MODEL} \\")
+    log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CFG['max_len']} claude")
+    log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
+else:
+    log("#  PUBLIC URL UNAVAILABLE — cloudflared tunnel failed")
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
 publish("ready", endpoint=endpoint, api_key=API_KEY, model=MODEL, max_model_len=CFG["max_len"],

@@ -161,10 +161,11 @@ minute with a plain message:
   that on phone-verified accounts.
 - **"datasets not attached"**: Add Input in the right sidebar and attach the names it lists (the
   two expert datasets and the serve dataset).
-- **The tunnel gives no URL**: the kernel tries three times. If it still fails, the server is
-  running but only reachable inside the kernel; start the session again. A fresh URL can take a
-  minute to resolve, and the kernel replaces one that never does, so watch the log for a
-  `NEW ENDPOINT` line before giving up.
+- **The tunnel gives no URL**: each of the three attempts tries the cloudflared default
+  protocol, HTTP/2, and QUIC before giving up. If all of them fail, the server is running but
+  only reachable inside the kernel; start the session again. A fresh URL can take a minute to
+  resolve, and the kernel replaces one that never does, so watch the log for a `NEW ENDPOINT`
+  line before giving up.
 - **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default)
   and Kaggle ends TPU sessions after nine hours.
 - **Anything else**: the log prints the step it was in and the error; paste that into an issue.
