@@ -1171,7 +1171,7 @@ def start_tunnel(attempts=3, wait_s=60):
                                    stderr=subprocess.STDOUT, text=True)
             q = queue.Queue()
             threading.Thread(
-                target=lambda proc=tun: [q.put(line) for line in iter(proc.stdout.readline, "")],
+                target=lambda proc=tun, output=q: [output.put(line) for line in iter(proc.stdout.readline, "")],
                 daemon=True,
             ).start()
             t0 = time.time()
