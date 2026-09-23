@@ -118,7 +118,7 @@ def main():
     for init in engine_dirs:
         cells.append(cell("markdown", "### The engine\nOne cell that writes the engine package next to the script. It is generated from the repo, so there is nothing to edit here; scroll past it.\n"))
         cells.append(cell("code", engine_cell(init.parent, init.parent.name)))
-    cells.append(cell("markdown", "### The serving script\nThe next cell writes the serving script (the same one `launch.py` pushes; the source and docs are in the [kaggle-tpu-lab repo](https://github.com/ARahim3/kaggle-tpu-lab)).\n"))
+    cells.append(cell("markdown", "### The serving script\nThe next cell writes the serving script (the same one `launch.py` pushes; the source and docs are in the [kaggle-tpu-lab repo](https://github.com/ugvfpdcuwfnh/kaggle-tpu-lab)).\n"))
     cells.append(cell("code", f"%%writefile {kernel.name}\n" + kernel.read_text()))
     cells.append(cell("markdown", LAUNCH_NOTES[model]))
     cells.append(cell("code", f"!python {kernel.name}\n"))

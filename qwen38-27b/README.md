@@ -53,7 +53,7 @@ pip install kaggle
 #   Linux/macOS: ~/.kaggle/kaggle.json     Windows: %USERPROFILE%\.kaggle\kaggle.json
 
 # 2. Get this repo and launch
-git clone https://github.com/ARahim3/kaggle-tpu-lab
+git clone https://github.com/ugvfpdcuwfnh/kaggle-tpu-lab
 cd kaggle-tpu-lab
 python launch.py serve
 ```
