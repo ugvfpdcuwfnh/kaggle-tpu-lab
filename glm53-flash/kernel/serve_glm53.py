@@ -1151,6 +1151,21 @@ log(f"   HTTP server on :{PORT}")
 banner(5, "Tunnel", "a public cloudflared URL")
 url = None
 TUN = [None]
+TUN_ATTEMPTS = []
+
+
+def stop_tunnel():
+    """Best-effort cleanup for the active cloudflared child process."""
+    proc = TUN[0]
+    TUN[0] = None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def start_tunnel(attempts=3, wait_s=60):
@@ -1159,19 +1174,31 @@ def start_tunnel(attempts=3, wait_s=60):
     A registration attempt that prints no URL within ``wait_s`` is terminated
     before the next protocol/attempt is tried.
     """
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com(?:/[^\s]*)?", re.I)
     protocols = (None, "http2", "quic")
     for i in range(attempts):
         for protocol in protocols:
-            cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
+            cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://localhost:{PORT}",
                    "--no-autoupdate"]
             if protocol:
                 cmd += ["--protocol", protocol]
-            tun = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True)
+            label = protocol or "default"
+            lines = []
+            log(f"   starting cloudflared ({label}): {' '.join(cmd)}")
+            try:
+                tun = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True)
+            except OSError as e:
+                TUN_ATTEMPTS.append({"protocol": label, "returncode": None,
+                                     "error": f"{type(e).__name__}: {e}"})
+                log(f"   cloudflared ({label}) could not start: {e}")
+                continue
             q = queue.Queue()
             threading.Thread(
-                target=lambda proc=tun, output=q: [output.put(line) for line in iter(proc.stdout.readline, "")],
+                target=lambda proc=tun, output=q, captured=lines: [
+                    (captured.append(line.rstrip()), output.put(line))
+                    for line in iter(proc.stdout.readline, "")
+                ],
                 daemon=True,
             ).start()
             t0 = time.time()
@@ -1185,6 +1212,8 @@ def start_tunnel(attempts=3, wait_s=60):
                 m = pat.search(line)
                 if m:
                     TUN[0] = tun
+                    TUN_ATTEMPTS.append({"protocol": label, "returncode": tun.poll(),
+                                         "output_tail": lines[-8:]})
                     return m.group(0)
             if tun.poll() is None:
                 tun.terminate()
@@ -1192,8 +1221,14 @@ def start_tunnel(attempts=3, wait_s=60):
                     tun.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     tun.kill()
-                    tun.wait()
-            log(f"   tunnel attempt {i + 1}/{attempts} ({protocol or 'default'}): "
+                    tun.wait(timeout=5)
+            TUN_ATTEMPTS.append({"protocol": label, "returncode": tun.returncode,
+                                 "output_tail": lines[-12:]})
+            if lines:
+                log(f"   cloudflared ({label}) output:")
+                for line in lines[-12:]:
+                    log(f"     {line}")
+            log(f"   tunnel attempt {i + 1}/{attempts} ({label}): "
                 f"no URL within {wait_s} s (cloudflared rc {tun.returncode}); retrying")
     return None
 
@@ -1210,15 +1245,17 @@ def tunnel_probe(u, wait_s=180):
         except Exception:  # noqa: BLE001
             time.sleep(10)
     log(f"   tunnel URL {u} did not answer in {wait_s} s: opening a new one")
-    if TUN[0] is not None:
-        TUN[0].kill()
+    stop_tunnel()
     new = start_tunnel()
     if new:
+        global url
+        url = new
         STATE["url"] = new
         publish("tunnel-url", endpoint=new)
         log(f"#  NEW ENDPOINT: {new}   (the earlier URL never resolved; the API key is unchanged)")
     else:
-        publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
+        publish("tunnel-failed", note="server still reachable inside the kernel on :8000",
+                attempts=TUN_ATTEMPTS)
 
 
 if CFG["tunnel"]:
@@ -1227,7 +1264,8 @@ if CFG["tunnel"]:
         publish("tunnel-url", endpoint=url)
         threading.Thread(target=tunnel_probe, args=(url,), daemon=True).start()
     else:
-        publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
+        publish("tunnel-failed", note="server still reachable inside the kernel on :8000",
+                attempts=TUN_ATTEMPTS)
 # Do not advertise the loopback fallback as a public endpoint. The launcher
 # treats a null endpoint as a tunnel failure and reports it explicitly.
 STATE["url"] = url
@@ -1288,10 +1326,13 @@ if globals().get("SERVE_FOREVER", True):
         time.sleep(120)
         if SCHED.thread is not None and not SCHED.thread.is_alive():
             publish("stopped", reason="scheduler-exit")
+            stop_tunnel()
+            srv.shutdown()
             sys.exit(1)
         up = int((time.time() - t_serve) / 60)
         if up % 10 < 2:
-            publish("heartbeat", up_min=up, endpoint=endpoint, requests=STATE["requests"], tokens=STATE["tokens"])
+            publish("heartbeat", up_min=up, endpoint=STATE["url"], requests=STATE["requests"], tokens=STATE["tokens"])
     publish("auto-shutdown", served_min=CFG["keepalive_min"])
+    stop_tunnel()
     SCHED.stop(); srv.shutdown()
     sys.exit(0)
