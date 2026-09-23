@@ -55,7 +55,7 @@ pip install kaggle
 # 2. Get this repo and launch
 git clone https://github.com/ugvfpdcuwfnh/kaggle-tpu-lab
 cd kaggle-tpu-lab
-python launch.py serve
+python launch.py serve --mtp 0
 ```
 
 That's it. The launcher pushes a script kernel to your Kaggle account, and streams
