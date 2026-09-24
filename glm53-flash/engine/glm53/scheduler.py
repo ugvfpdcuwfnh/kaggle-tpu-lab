@@ -401,11 +401,13 @@ class Scheduler:
         if best[2] is not None:
             k, fed, key = best
             ctx = self.live.pop(key)
+            # `live` no longer owns this cache.  Register it before _prefill:
+            # that call can fail, in which case _admit() must reclaim it.
+            self._admission_caches = ctx["caches"]
             st["prefix_hits"] = st.get("prefix_hits", 0) + 1
             st["prefix_tokens_reused"] = st.get("prefix_tokens_reused", 0) + k
             if k == len(prompt):
                 logits, caches, pos = ctx["logits"], ctx["caches"], ctx["pos"]
-                self._admission_caches = caches
             else:
                 logits, caches, pos = self._prefill(req, k, len(prompt), ctx["caches"], ctx["pos"])
                 self._admission_caches = caches

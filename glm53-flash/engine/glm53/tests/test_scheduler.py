@@ -4,6 +4,8 @@ LRU context into the host snapshot store and a later turn resumes it, cancellati
 tokens equal its own single-stream greedy generation."""
 import threading
 import time
+from collections import OrderedDict
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -40,6 +42,25 @@ def wait(req, timeout=600):
     assert req.done.wait(timeout), "request did not finish"
     assert req.error is None, req.error
     return req
+
+
+def test_live_cache_is_reclaimed_if_extension_prefill_raises():
+    """A cache popped from live is owned by the admission transaction before prefill."""
+    sched = Scheduler.__new__(Scheduler)
+    caches = object()
+    sched.live = OrderedDict([(1, {"ids": [1], "caches": caches, "pos": 1, "logits": None})])
+    sched.state = {}
+    sched._admission_caches = None
+    sched.match_len = lambda ids, pos, prompt, quiet=True: (1, None)
+    sched._prefill = lambda *args: (_ for _ in ()).throw(RuntimeError("prefill failed"))
+    freed = []
+    sched._free_set = freed.append
+
+    with pytest.raises(RuntimeError, match="prefill failed"):
+        sched._admit(SimpleNamespace(prompt=[1, 2]))
+
+    assert freed == [caches]
+    assert sched._admission_caches is None
 
 
 def test_batched_requests_and_context_reuse():
