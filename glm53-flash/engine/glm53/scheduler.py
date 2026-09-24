@@ -155,7 +155,7 @@ class Scheduler:
 
     def __init__(self, eng, stop_ids, max_streams=4, max_sets=None, feed=None, match_len=match_prefix,
                  system_end=None, first_sample=_argmax_first, snaps=None, log=print, state=None,
-                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0, engine_lock=None):
+                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0, engine_lock=None, max_pending=0):
         self.eng, self.stop_ids = eng, set(int(t) for t in stop_ids)
         self.max_streams = max(1, int(max_streams))
         self.max_sets = max(self.max_streams, int(max_sets if max_sets is not None else max_streams + 1))
@@ -168,6 +168,7 @@ class Scheduler:
         self.piece = piece or eng.prefill_piece
         self.min_free_gb = min_free_gb                  # HBM headroom an admission needs (prefill temporaries); 0 = off
         self.max_wait_s = max_wait_s                    # a request queued longer than this fails ("queue_timeout")
+        self.max_pending = max(0, int(max_pending))      # 0 means unbounded; checked under cond by try_submit
         self.engine_lock = engine_lock or threading.RLock()  # serializes every JAX/TPU operation with vision work
         self.live = collections.OrderedDict()            # finished contexts on the chips (LRU): key -> ctx dict
         self._live_n = 0
@@ -186,16 +187,28 @@ class Scheduler:
         self.steps = 0
 
     # ---- client side
-    def submit(self, req: Request):
+    def try_submit(self, req: Request):
+        """Atomically reserve a pending slot, returning accepted/full/shutdown.
+
+        HTTP handlers must use this instead of reading pending and active separately:
+        several handlers can otherwise all pass a capacity check then overfill the deque.
+        """
         if len(req.prompt) + 2 > self.eng.max_len:
             self._fail(req, ValueError(f"prompt of {len(req.prompt)} tokens exceeds the context capacity {self.eng.max_len}"))
-            return req
+            return "invalid"
         with self.cond:
             if self._stopping:
                 self._fail(req, RuntimeError("scheduler is shutting down"), "shutdown")
-                return req
+                return "shutdown"
+            if self.max_pending and len(self.pending) >= self.max_pending:
+                return "full"
             self.pending.append(req)
             self.cond.notify()
+            return "accepted"
+
+    def submit(self, req: Request):
+        """Compatibility wrapper; callers that need an HTTP capacity response use try_submit."""
+        self.try_submit(req)
         return req
 
     def start(self):

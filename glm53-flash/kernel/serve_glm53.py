@@ -538,7 +538,7 @@ for k in _drop:
 SNAPS = SnapStore(eng, int(SNAP_HOST_GB * 1e9), SNAP_ROWS, match_len=_match_len, log=log, state=STATE)
 SCHED = Scheduler(eng, STOP_IDS, MAX_STREAMS, MAX_SETS, feed=sched_feed, match_len=_match_len, system_end=system_end,
                   first_sample=lambda z, t, p: sample(z, t, p, RNG), snaps=SNAPS, log=log, state=STATE,
-                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S, engine_lock=TPU_JAX_LOCK)
+                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S, engine_lock=TPU_JAX_LOCK, max_pending=MAX_QUEUE)
 
 
 class QueueFull(Exception):
@@ -557,14 +557,16 @@ def generate(prompt, max_new, temperature, top_p, on_token=None, imgs=None, rid=
     | "stop_sequence" (`on_token` returned True: cancelled there) | "cancelled". Tokens reach `on_token` on THIS thread;
     `on_idle` is called when no token arrived for KEEPALIVE_S (a queued request); `budget` = Request.budget."""
     prompt = [int(t) for t in prompt]
-    if MAX_QUEUE and len(SCHED.pending) + len(SCHED.active) >= MAX_STREAMS + MAX_QUEUE:
-        raise QueueFull(f"{len(SCHED.active)} requests running and {len(SCHED.pending)} waiting; retry later")
     q = queue.Queue()
     req = Request(prompt, max_new, temperature, top_p, imgs=imgs, rid=rid, budget=budget,
                   on_token=q.put if on_token else None, on_done=(lambda: q.put(None)) if on_token else None)
     req.sig = np.asarray(prompt, np.int64)
     req.off = _run_offsets(req.sig) if imgs else np.zeros(len(prompt), np.int64)
-    SCHED.submit(req)
+    admission = SCHED.try_submit(req)
+    if admission == "full":
+        raise QueueFull(f"scheduler queue is full ({MAX_QUEUE} waiting); retry later")
+    if admission == "shutdown":
+        raise RuntimeError("scheduler is shutting down")
     stopped = False
     # A scheduler shutdown or a wedged engine must never leave an HTTP worker blocked forever.
     wait_deadline = time.monotonic() + max(30.0, float(MAX_WAIT_S or 90.0) + 60.0)
