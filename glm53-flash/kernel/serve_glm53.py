@@ -23,6 +23,7 @@ kernel output) that later runs attach instead of the FP8 datasets.
 """
 import base64, collections, glob, hashlib, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 
 CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
@@ -66,6 +67,12 @@ DEFAULTS = {
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
     "port": 8000,
+    "max_body_bytes": 8 * 1024 * 1024,
+    "max_image_bytes": 10 * 1024 * 1024,
+    "max_image_pixels": 20_000_000,
+    "max_image_side": 8192,
+    "http_timeout_s": 30,
+    "http_workers": 32,
 }
 CFG = {**DEFAULTS, **(CFG or {}), **globals().get("CFG_PRESET", {})}
 _cfg_file = Path("serve_config.json")            # notebook flow: overrides next to this script
@@ -340,6 +347,12 @@ from glm53 import vision as VIS                           # noqa: E402
 
 API_KEY = CFG["api_key"]
 MAX_NEW_DEFAULT = CFG["max_new_default"]
+MAX_BODY_BYTES = int(CFG["max_body_bytes"])
+MAX_IMAGE_BYTES = int(CFG["max_image_bytes"])
+MAX_IMAGE_PIXELS = int(CFG["max_image_pixels"])
+MAX_IMAGE_SIDE = int(CFG["max_image_side"])
+HTTP_TIMEOUT_S = float(CFG["http_timeout_s"])
+HTTP_WORKERS = max(1, int(CFG["http_workers"]))
 KEEPALIVE_S = float(CFG["keepalive_s"] or 0)
 THINK_BUDGET_DEFAULT = int(CFG["think_budget_default"] or 0)
 MAX_STREAMS, MAX_SETS = CFG["streams"], CFG["sets"]
@@ -394,7 +407,7 @@ def embed_image(img_bytes):
             IMG_CACHE.move_to_end(h)
             return hit
     try:
-        patches, grid = VIS.preprocess(Image.open(io.BytesIO(img_bytes)), max_tokens=VISION_MAX_TOKENS)
+        patches, grid = VIS.preprocess(_safe_image(img_bytes), max_tokens=VISION_MAX_TOKENS)
         n = patches.shape[0]
         bucket = max(256, 1 << (n - 1).bit_length())
         grids = (grid,) if bucket == n else (grid, (1, 2, (bucket - n) // 2))
@@ -420,20 +433,61 @@ def embed_image(img_bytes):
                 event.set()
 
 
+def _limited_b64(data):
+    if not isinstance(data, str) or len(data) > (MAX_IMAGE_BYTES * 4 // 3 + 16):
+        raise ValueError("image base64 payload is missing or too large")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("invalid image base64") from e
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError("image exceeds byte limit")
+    return raw
+
+
+def _safe_image(raw):
+    """Decode only bounded, ordinary raster images before passing data to Pillow/JAX."""
+    from PIL import Image
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError("image exceeds byte limit")
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        im = Image.open(io.BytesIO(raw))
+        if im.format not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
+            raise ValueError("unsupported image format")
+        if im.width < 1 or im.height < 1 or im.width > MAX_IMAGE_SIDE or im.height > MAX_IMAGE_SIDE:
+            raise ValueError("image dimensions exceed limit")
+        if im.width * im.height > MAX_IMAGE_PIXELS:
+            raise ValueError("image pixel count exceeds limit")
+        im.load()
+        return im.copy()
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("invalid or unsafe image") from e
+
+
 def _image_bytes(block):
-    """Anthropic image block or OpenAI image_url part -> raw bytes (base64 or data: URL inline; http(s) fetched)."""
+    """Read a size-bounded image; remote fetches have both deadline and byte cap."""
     if block.get("type") == "image":
         src = block.get("source", {})
         if src.get("type") == "base64":
-            return base64.b64decode(src["data"])
+            return _limited_b64(src.get("data"))
         url = src.get("url", "")
     else:
         u = block.get("image_url", "")
         url = u.get("url", "") if isinstance(u, dict) else u
     if url.startswith("data:"):
-        return base64.b64decode(url.split(",", 1)[1])
+        return _limited_b64(url.split(",", 1)[1] if "," in url else "")
     if url.startswith("http://") or url.startswith("https://"):
-        return urllib.request.urlopen(url, timeout=30).read()
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_S) as response:
+            length = response.headers.get("Content-Length")
+            if length and (not length.isdigit() or int(length) > MAX_IMAGE_BYTES):
+                raise ValueError("remote image exceeds byte limit")
+            raw = response.read(MAX_IMAGE_BYTES + 1)
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError("remote image exceeds byte limit")
+        return raw
     raise ValueError("unsupported image source")
 
 
@@ -955,6 +1009,10 @@ def effort_of(req, default=DEFAULT_EFFORT):
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"      # one request per connection: SSE responses carry no framing for keep-alive
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(HTTP_TIMEOUT_S)
+
     def log_message(self, *a):
         pass
 
@@ -993,9 +1051,17 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth():
             return self._json(401, {"error": {"type": "authentication_error", "message": "bad api key"}})
-        n = int(self.headers.get("Content-Length", 0))
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None or not raw_length.isdigit():
+            return self._json(400, {"error": {"type": "invalid_request_error", "message": "valid Content-Length required"}})
+        n = int(raw_length)
+        if n > MAX_BODY_BYTES:
+            return self._json(413, {"error": {"type": "invalid_request_error", "message": "request body too large"}})
         try:
-            req = json.loads(self.rfile.read(n) or b"{}")
+            payload = self.rfile.read(n)
+            if len(payload) != n:
+                raise ValueError("incomplete request body")
+            req = json.loads(payload or b"{}")
         except Exception as e:  # noqa: BLE001
             return self._json(400, {"error": str(e)})
         try:
@@ -1178,8 +1244,29 @@ if CACHE_DIR.exists():
     log(f"   compile cache: {n_files} entries, {size:.2f} GB in {CACHE_DIR}")
 publish("warmed", minutes=round((time.time() - t_warm) / 60, 1), hbm_gb=round(use, 2))
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap so slow clients cannot create unbounded handlers."""
+    daemon_threads = True
+
+    def __init__(self, *args, max_workers=HTTP_WORKERS, **kwargs):
+        self._slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            request.close()
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 SCHED.start()
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = BoundedHTTPServer(("0.0.0.0", PORT), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 log(f"   HTTP server on :{PORT}")
 
