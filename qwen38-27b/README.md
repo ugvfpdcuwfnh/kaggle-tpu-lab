@@ -19,7 +19,7 @@ native **262,144-token context**, and real speed:
 
 Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades beyond
 that (verification competes with batch compute). Serving many users? Launch with
-`--max-model-len 131072 --max-num-seqs 16 --mtp 0` for max aggregate throughput.
+`--max-model-len 131072 --max-num-seqs 16` for max aggregate throughput.
 
 ## How this works
 
@@ -55,7 +55,7 @@ pip install kaggle
 # 2. Get this repo and launch
 git clone https://github.com/ugvfpdcuwfnh/kaggle-tpu-lab
 cd kaggle-tpu-lab
-python launch.py serve --mtp 0
+python launch.py serve
 ```
 
 That's it. The launcher pushes a script kernel to your Kaggle account, and streams
@@ -201,7 +201,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
   of that size is instant. Coding agents send screenshots at a consistent size, so this
   is paid once. `--text-only` drops image support and ~8 min of startup.
 - **MTP speculative decoding: on by default, and there's a story.** Qwen3.8 ships a
-  native MTP draft head, but stock vllm-tpu 0.28.0 **corrupts outputs** with it on
+  native MTP draft head, but stock vllm-tpu 0.28.0 has unsafe paths with it on
   TPU — rejected draft tokens advance the gated-DeltaNet recurrent state and are never
   rolled back (0/12 greedy prompts matched in our verification, with visible garbage).
   The fix exists as a stalled upstream PR
@@ -212,7 +212,8 @@ folder in the Kaggle UI (Output tab → New Dataset).
   non-speculative outputs exactly**, at +34 % decode speed in the A/B test (104 vs 78 tok/s at the time; the shipped config now measures ~130; healthy
   acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
-  than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.
+  than serve corrupted outputs. MTP is **off by default**; `--mtp 1` through `--mtp 3` opt in (k=4 fails to start).
+  Enabling MTP forces `async_scheduling=false`; only `--unsafe-async-mtp` permits the known-unsafe combination.
 - **Harmless log noise.** vLLM prints a few scary-looking lines on every TPU start:
   `Unable to poll the TPU GCE Metadata` (Kaggle isn't a GCE VM), `Failed to import
   from vllm._C` (that's the CUDA extension), `Triton ... 0 active driver(s)`, and
@@ -230,8 +231,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
   or the account is not phone-verified yet, which disables it.
 - **The server exits the moment a client connects, with `AttributeError: __delitem__`**: the client used JSON
   mode / structured outputs while MTP and vLLM's async scheduling are on, a path vllm-tpu 0.28.0 cannot handle.
-  Set `"async_scheduling": false` in the config cell (`--no-async-scheduling` from the launcher), or
-  `"mtp_tokens": 0`.
+  MTP launch configuration forces `"async_scheduling": false` automatically; leave MTP off unless it is needed.
 - **Anything else**: the kernel now prints the root cause and the first error block from `vllm.log` when the
   server dies; paste that into an issue.
 

@@ -47,7 +47,7 @@ DEFAULTS = {
     "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
-    "mtp_tokens": 3,               # MTP spec decoding (+34% in our A/B test). Stock vllm-tpu
+    "mtp_tokens": 0,               # Disabled by default: vllm-tpu MTP has unsafe paths; opt in only after testing.
                                    # 0.28.0 corrupts outputs with it (missing GDN state
                                    # rollback); we apply patches/mtp-rollback-v0280.diff
                                    # (a port of upstream PR #3178) before serving —
@@ -77,6 +77,13 @@ CFG = {**DEFAULTS, **(CFG or {})}
 _cfg_file = Path("serve_config.json")
 if _cfg_file.exists():
     CFG.update(json.loads(_cfg_file.read_text()))
+if not isinstance(CFG["mtp_tokens"], int) or isinstance(CFG["mtp_tokens"], bool) or not 0 <= CFG["mtp_tokens"] <= 3:
+    raise ValueError("mtp_tokens must be an integer from 0 through 3")
+if CFG["mtp_tokens"] > 0 and not CFG.get("allow_unsafe_async_mtp", False):
+    # vllm-tpu 0.28.0 corrupts/fails on this combination; never inherit its async default.
+    CFG["async_scheduling"] = False
+if CFG["mtp_tokens"] > 0 and CFG.get("async_scheduling") and not CFG.get("allow_unsafe_async_mtp", False):
+    raise ValueError("MTP requires async_scheduling=false unless allow_unsafe_async_mtp=true")
 if not CFG["api_key"]:
     CFG["api_key"] = "sk-" + secrets.token_hex(16)
 

@@ -122,12 +122,19 @@ def cmd_serve(args):
     api_key = ("glm-" if args.model == "glm53-flash" else "sk-") + secrets.token_hex(16)
 
     if args.model == "qwen38-27b":
+        if args.mtp < 0 or args.mtp > 3:
+            sys.exit("--mtp must be an integer from 0 through 3")
+        if args.unsafe_async_mtp and args.mtp == 0:
+            sys.exit("--unsafe-async-mtp requires --mtp > 0")
         cfg = {
             "ntfy_topic": topic,
             "api_key": api_key,
             "max_model_len": args.max_model_len,
             "max_num_seqs": args.max_num_seqs,
             "mtp_tokens": args.mtp,
+            # Do not leave this at vLLM's implicit default: MTP needs serial scheduling.
+            "async_scheduling": False if args.mtp > 0 or not args.unsafe_async_mtp else None,
+            "allow_unsafe_async_mtp": bool(args.unsafe_async_mtp),
             "reasoning_effort_default": args.reasoning_effort,
             "keepalive_min": args.keepalive_min,
             "weights_dataset": args.weights_dataset,
@@ -142,6 +149,8 @@ def cmd_serve(args):
             cfg["fast_start"] = True
         if args.no_async_scheduling:
             cfg["async_scheduling"] = False
+        if args.unsafe_async_mtp:
+            cfg["async_scheduling"] = True
         datasets = [args.weights_dataset, ENV_DATASET]
     else:
         cfg = {
@@ -427,10 +436,9 @@ def main():
                    help="context length (default: native 262k; use 131072 with "
                         "--max-num-seqs 16 for max multi-stream throughput)")
     s.add_argument("--max-num-seqs", type=int, default=4)
-    s.add_argument("--mtp", type=int, default=3,
-                   help="MTP speculative tokens (0 disables). +34%% decode in our A/B test; made "
-                        "lossless by the bundled GDN state-rollback patch "
-                        "(verified 12/12 greedy exact-match)")
+    s.add_argument("--mtp", type=int, default=0,
+                   help="MTP speculative tokens (0 disables; the safe default). Values 1-3 opt in and force "
+                        "--no-async-scheduling unless --unsafe-async-mtp is also supplied.")
     s.add_argument("--reasoning-effort", default="xhigh",
                    choices=["xhigh", "high", "medium", "low"],
                    help="server-side default; clients can still override per request "
@@ -445,6 +453,8 @@ def main():
                         "then error out")
     s.add_argument("--verbose", action="store_true",
                    help="show every vLLM log line in the kernel log")
+    s.add_argument("--unsafe-async-mtp", action="store_true",
+                   help="EXPERT ONLY: permit MTP with vLLM async scheduling; known unstable/corrupting on vllm-tpu 0.28.0")
     s.add_argument("--no-async-scheduling", action="store_true",
                    help="qwen38-27b: pass --no-async-scheduling to vLLM. Needed when clients use JSON mode / "
                         "structured outputs with MTP on (vllm-tpu 0.28.0 otherwise exits with AttributeError: "
