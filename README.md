@@ -43,7 +43,7 @@ Each folder README has the exact lines for Claude Code, Codex CLI and opencode.
 ```bash
 git clone https://github.com/ugvfpdcuwfnh/kaggle-tpu-lab
 cd kaggle-tpu-lab
-python launch.py serve --mtp 0   # Qwen3.8-27B today; --model picks another recipe once there is one
+python launch.py serve   # Qwen3.8-27B today; --model picks another recipe once there is one
 ```
 
 `launch.py` pushes the kernel with the Kaggle CLI and follows its progress; `status`
