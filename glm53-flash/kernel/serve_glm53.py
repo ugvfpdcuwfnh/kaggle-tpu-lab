@@ -1254,7 +1254,19 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            request.close()
+            # This runs in serve_forever's accept loop, before a handler thread
+            # exists.  Return a small deterministic response here instead of
+            # silently dropping the socket; clients can then retry safely.
+            try:
+                request.settimeout(1)
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Retry-After: 1\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
             return
         super().process_request(request, client_address)
 

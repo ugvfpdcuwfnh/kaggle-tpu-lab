@@ -200,7 +200,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
   ~1 min and may even time out at the tunnel (HTTP 524) — just retry; every later image
   of that size is instant. Coding agents send screenshots at a consistent size, so this
   is paid once. `--text-only` drops image support and ~8 min of startup.
-- **MTP speculative decoding: on by default, and there's a story.** Qwen3.8 ships a
+- **MTP speculative decoding: optional, and there's a story.** Qwen3.8 ships a
   native MTP draft head, but stock vllm-tpu 0.28.0 has unsafe paths with it on
   TPU — rejected draft tokens advance the gated-DeltaNet recurrent state and are never
   rolled back (0/12 greedy prompts matched in our verification, with visible garbage).

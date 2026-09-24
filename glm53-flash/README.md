@@ -129,6 +129,8 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
 
 - **Three concurrent streams** is the HBM limit at the full context; a fourth request waits for a
   free slot (up to 90 s, then a 503). More than eight waiting requests get a 429.
+- **HTTP handler saturation** returns `503 Service Unavailable` with `Retry-After: 1` rather than
+  silently dropping the connection. Retry that response with normal client backoff.
 - **Startup.** The weights take ~4 minutes: the base store in under a minute, then the experts, read from
   the dataset mount (~650 MB/s to parallel readers) and packed onto the chips in eight threads. The warm-up is ~9 minutes with
   the serve dataset's compile cache and ~14 without; what the cache cannot skip is JAX tracing the

@@ -132,8 +132,8 @@ def cmd_serve(args):
             "max_model_len": args.max_model_len,
             "max_num_seqs": args.max_num_seqs,
             "mtp_tokens": args.mtp,
-            # Do not leave this at vLLM's implicit default: MTP needs serial scheduling.
-            "async_scheduling": False if args.mtp > 0 or not args.unsafe_async_mtp else None,
+            # MTP needs serial scheduling; with MTP off, inherit vLLM's safe default.
+            "async_scheduling": False if args.mtp > 0 else None,
             "allow_unsafe_async_mtp": bool(args.unsafe_async_mtp),
             "reasoning_effort_default": args.reasoning_effort,
             "keepalive_min": args.keepalive_min,
