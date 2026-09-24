@@ -363,32 +363,61 @@ STOP_IDS = set(eos) | {T["<|user|>"], T["<|observation|>"]}
 # ---- images
 IMG_CACHE = collections.OrderedDict()                  # sha256 -> (n_tokens, embeddings f32 [n, D]); LRU
 IMG_CACHE_MAX = 64
+IMG_CACHE_LOCK = threading.Lock()
+IMG_INFLIGHT = {}                                         # sha256 -> Event: collapse identical concurrent image work
+TPU_JAX_LOCK = threading.RLock()                          # vision and scheduler must never overlap JAX/TPU calls
 
 
 def embed_image(img_bytes):
-    """Image bytes -> (n_tokens, embeddings [n, D] f32) through the vision tower; cached by content hash. The patch
-    count is padded to a power of two with a dummy image segment (its rows are dropped) so few shapes compile."""
+    """Embed one image without racing JAX or duplicate cache fills across HTTP threads."""
     from PIL import Image
     if VISION_FWD is None:
         raise ValueError("this server has no vision tower loaded (config: vision)")
     h = hashlib.sha256(img_bytes).hexdigest()
-    if h in IMG_CACHE:
-        IMG_CACHE.move_to_end(h)
-        return IMG_CACHE[h]
-    patches, grid = VIS.preprocess(Image.open(io.BytesIO(img_bytes)), max_tokens=VISION_MAX_TOKENS)
-    n = patches.shape[0]
-    bucket = max(256, 1 << (n - 1).bit_length())
-    grids = (grid,) if bucket == n else (grid, (1, 2, (bucket - n) // 2))
-    if bucket > n:
-        patches = np.concatenate([patches, np.zeros((bucket - n, patches.shape[1]), patches.dtype)], 0)
-    t = time.time()
-    out = np.asarray(VISION_FWD(patches, grids), np.float32)[:VIS.n_tokens(grid)]
-    STATE["vision_s"] = STATE.get("vision_s", 0.0) + time.time() - t
-    STATE["images"] = STATE.get("images", 0) + 1
-    IMG_CACHE[h] = (out.shape[0], out)
-    while len(IMG_CACHE) > IMG_CACHE_MAX:
-        IMG_CACHE.popitem(last=False)
-    return IMG_CACHE[h]
+    with IMG_CACHE_LOCK:
+        hit = IMG_CACHE.get(h)
+        if hit is not None:
+            IMG_CACHE.move_to_end(h)
+            return hit
+        waiter = IMG_INFLIGHT.get(h)
+        if waiter is None:
+            waiter = IMG_INFLIGHT[h] = threading.Event()
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        waiter.wait()
+        with IMG_CACHE_LOCK:
+            hit = IMG_CACHE.get(h)
+            if hit is None:
+                raise RuntimeError("concurrent image embedding failed")
+            IMG_CACHE.move_to_end(h)
+            return hit
+    try:
+        patches, grid = VIS.preprocess(Image.open(io.BytesIO(img_bytes)), max_tokens=VISION_MAX_TOKENS)
+        n = patches.shape[0]
+        bucket = max(256, 1 << (n - 1).bit_length())
+        grids = (grid,) if bucket == n else (grid, (1, 2, (bucket - n) // 2))
+        if bucket > n:
+            patches = np.concatenate([patches, np.zeros((bucket - n, patches.shape[1]), patches.dtype)], 0)
+        t = time.time()
+        # The scheduler takes this same lock around admission, decode, snapshots and cache transitions.
+        with TPU_JAX_LOCK:
+            out = np.asarray(VISION_FWD(patches, grids), np.float32)[:VIS.n_tokens(grid)]
+        value = (out.shape[0], out)
+        STATE["vision_s"] = STATE.get("vision_s", 0.0) + time.time() - t
+        STATE["images"] = STATE.get("images", 0) + 1
+        with IMG_CACHE_LOCK:
+            IMG_CACHE[h] = value
+            IMG_CACHE.move_to_end(h)
+            while len(IMG_CACHE) > IMG_CACHE_MAX:
+                IMG_CACHE.popitem(last=False)
+        return value
+    finally:
+        with IMG_CACHE_LOCK:
+            event = IMG_INFLIGHT.pop(h, None)
+            if event is not None:
+                event.set()
 
 
 def _image_bytes(block):
@@ -509,7 +538,7 @@ for k in _drop:
 SNAPS = SnapStore(eng, int(SNAP_HOST_GB * 1e9), SNAP_ROWS, match_len=_match_len, log=log, state=STATE)
 SCHED = Scheduler(eng, STOP_IDS, MAX_STREAMS, MAX_SETS, feed=sched_feed, match_len=_match_len, system_end=system_end,
                   first_sample=lambda z, t, p: sample(z, t, p, RNG), snaps=SNAPS, log=log, state=STATE,
-                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S)
+                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S, engine_lock=TPU_JAX_LOCK)
 
 
 class QueueFull(Exception):

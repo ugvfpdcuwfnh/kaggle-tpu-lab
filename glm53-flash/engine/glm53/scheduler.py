@@ -155,7 +155,7 @@ class Scheduler:
 
     def __init__(self, eng, stop_ids, max_streams=4, max_sets=None, feed=None, match_len=match_prefix,
                  system_end=None, first_sample=_argmax_first, snaps=None, log=print, state=None,
-                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0):
+                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0, engine_lock=None):
         self.eng, self.stop_ids = eng, set(int(t) for t in stop_ids)
         self.max_streams = max(1, int(max_streams))
         self.max_sets = max(self.max_streams, int(max_sets if max_sets is not None else max_streams + 1))
@@ -168,6 +168,7 @@ class Scheduler:
         self.piece = piece or eng.prefill_piece
         self.min_free_gb = min_free_gb                  # HBM headroom an admission needs (prefill temporaries); 0 = off
         self.max_wait_s = max_wait_s                    # a request queued longer than this fails ("queue_timeout")
+        self.engine_lock = engine_lock or threading.RLock()  # serializes every JAX/TPU operation with vision work
         self.live = collections.OrderedDict()            # finished contexts on the chips (LRU): key -> ctx dict
         self._live_n = 0
         self.active = []
@@ -294,7 +295,8 @@ class Scheduler:
                 if req.cancelled:
                     self._fail(req, None, "cancelled"); continue
                 try:
-                    self._admit(req)
+                    with self.engine_lock:
+                        self._admit(req)
                 except Exception as e:  # noqa: BLE001
                     import gc, traceback
                     self.log("admission failed:", traceback.format_exc()[-1500:])
@@ -304,7 +306,8 @@ class Scheduler:
                 continue
             if self.active:
                 try:
-                    self._step()
+                    with self.engine_lock:
+                        self._step()
                 except Exception as e:  # noqa: BLE001
                     import gc, traceback
                     self.log("decode step failed:", traceback.format_exc()[-1500:])
