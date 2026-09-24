@@ -7,10 +7,10 @@ No GPU, no cloud bill, about twenty minutes from pressing Run to a URL.
 Each model has its own folder with a run-all Kaggle notebook, the kernel script behind
 it, and a write-up of how it works and what we measured.
 
-| Model | Weights on the TPU | Context | One stream | Many streams | Prefill | Run → URL | Engine | |
-|---|---|---|---|---|---|---|---|---|
-| [Qwen3.8-27B](qwen38-27b/) | bf16, no quantization | 262k | ~130 tok/s | ~540 tok/s at 8 | 10,300 tok/s | ~22 min | vllm-tpu + one patch | [notebook](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api) |
-| [GLM-5.3-Flash](glm53-flash/) (320B MoE) | 3-bit experts, int8 rest | 262k | ~64 tok/s | ~90 tok/s at 3 | ~1,600 tok/s | ~16 min | our own JAX engine | [notebook](https://www.kaggle.com/code/rahim3/glm-5-3-flash-on-a-free-kaggle-tpu-64-tok-s-api) |
+| Model | Weights on the TPU | Context | One stream | Many streams | Prefill | Run → URL | Engine |
+|---|---|---|---|---|---|---|---|
+| [Qwen3.8-27B](qwen38-27b/) | bf16, no quantization | 262k | ~130 tok/s | ~540 tok/s at 8 | 10,300 tok/s | ~22 min | vllm-tpu + one patch |
+| [GLM-5.3-Flash](glm53-flash/) (320B MoE) | 3-bit experts, int8 rest | 262k | ~64 tok/s | ~90 tok/s at 3 | ~1,600 tok/s | ~16 min | our own JAX engine |
 
 Numbers are measured on the shipped configuration; the folder READMEs say how. Qwen runs on
 vllm-tpu with one patch. GLM-5.3-Flash runs on an engine we wrote in JAX for it; as far as we
