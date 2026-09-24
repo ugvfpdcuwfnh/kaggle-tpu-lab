@@ -177,6 +177,7 @@ class Scheduler:
         self._members = None                             # ids of the streams the device state below belongs to
         self._toks = self._pos = None
         self._stop = False
+        self._stopping = False
         self._paused, self._idle = False, threading.Event()
         self._waits = 0
         self._t_step = None
@@ -189,6 +190,9 @@ class Scheduler:
             self._fail(req, ValueError(f"prompt of {len(req.prompt)} tokens exceeds the context capacity {self.eng.max_len}"))
             return req
         with self.cond:
+            if self._stopping:
+                self._fail(req, RuntimeError("scheduler is shutting down"), "shutdown")
+                return req
             self.pending.append(req)
             self.cond.notify()
         return req
@@ -198,17 +202,30 @@ class Scheduler:
         self.thread.start()
         return self.thread
 
-    def stop(self):
+    def stop(self, timeout=60.0):
+        """Atomically close admission and wake every queued client before joining.
+
+        A bounded join prevents a stuck JAX call from making HTTP handlers wait
+        forever. Cache release is deferred until the engine worker has really exited.
+        """
         with self.cond:
-            self._stop = True
+            self._stopping = self._stop = True
+            pending = list(self.pending)
+            self.pending.clear()
             self.cond.notify_all()
+        for req in pending:
+            self._fail(req, RuntimeError("scheduler is shutting down"), "shutdown")
         if self.thread is not None:
-            self.thread.join(timeout=60)
+            self.thread.join(timeout=timeout)
+            if self.thread.is_alive():
+                self.log(f"scheduler did not stop within {timeout:.0f}s; retaining caches until worker exits")
+                return False
         for ctx in self.live.values():
             self._free_set(ctx["caches"])
-        for s in self.active:
-            self._free_set(s.caches)
+        for stream in self.active:
+            self._free_set(stream.caches)
         self.live.clear(); self.active.clear(); self._toks = self._pos = None
+        return True
 
     @staticmethod
     def _free_set(caches):

@@ -537,6 +537,8 @@ def generate(prompt, max_new, temperature, top_p, on_token=None, imgs=None, rid=
     req.off = _run_offsets(req.sig) if imgs else np.zeros(len(prompt), np.int64)
     SCHED.submit(req)
     stopped = False
+    # A scheduler shutdown or a wedged engine must never leave an HTTP worker blocked forever.
+    wait_deadline = time.monotonic() + max(30.0, float(MAX_WAIT_S or 90.0) + 60.0)
     if on_token:
         while True:
             try:
@@ -557,7 +559,9 @@ def generate(prompt, max_new, temperature, top_p, on_token=None, imgs=None, rid=
             except Exception:
                 req.cancel()
                 raise
-    req.done.wait()
+    if not req.done.wait(timeout=max(0.0, wait_deadline - time.monotonic())):
+        req.cancel()
+        raise TimeoutError("scheduler did not complete the request before its bounded wait deadline")
     if req.error is not None:
         raise req.error
     return req.out, req.prefill_s, req.decode_s, req.reused, ("stop_sequence" if stopped else req.stop_reason)
