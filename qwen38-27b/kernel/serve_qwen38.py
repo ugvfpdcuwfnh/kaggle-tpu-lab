@@ -319,25 +319,56 @@ def stop_process_group(proc, name="child", term_timeout=20, kill_timeout=10):
     launch_server and cloudflared each create a session, so killing the group cannot
     leave TPU workers or tunnel helpers behind when startup raises or times out.
     """
-    if proc is None or proc.poll() is not None:
+    if proc is None:
+        return
+    # These children are launched with start_new_session=True, hence the leader
+    # PID is also the process-group ID.  Do not fall back to our own group if a
+    # caller ever passes an unmanaged Popen object.
+    pgid = proc.pid
+    if not isinstance(pgid, int) or pgid <= 0 or pgid == os.getpgrp():
+        log(f"   refusing to stop unsafe {name} process group {pgid!r}")
         return
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        # Still signal the group after its leader has exited: cloudflared can
+        # leave a descendant in that group, and Popen.poll() only observes the
+        # leader.
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
+
+    deadline = time.monotonic() + term_timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=min(0.2, max(0.01, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(0.05)
+
+    log(f"   {name} process group did not exit after SIGTERM; sending SIGKILL")
     try:
-        proc.wait(timeout=term_timeout)
-        return
-    except subprocess.TimeoutExpired:
-        log(f"   {name} did not exit after SIGTERM; sending SIGKILL to its process group")
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         return
     try:
         proc.wait(timeout=kill_timeout)
     except subprocess.TimeoutExpired:
-        log(f"   {name} process group still did not reap after SIGKILL")
+        pass
+    # The leader may already have exited while a child was still alive;
+    # continue polling the group so this does not falsely claim cleanup.
+    deadline = time.monotonic() + kill_timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    log(f"   {name} process group still exists after SIGKILL")
 
 
 def stop_tunnel(proc):
@@ -889,13 +920,7 @@ try:
                 tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.poll(),
                                         "output_tail": lines[-8:]})
                 break
-            if tunnel.poll() is None:
-                tunnel.terminate()
-                try:
-                    tunnel.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    tunnel.kill()
-                    tunnel.wait(timeout=5)
+            stop_tunnel(tunnel)
             cf_reader.join(timeout=2)
             tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.returncode,
                                     "output_tail": lines[-12:]})
