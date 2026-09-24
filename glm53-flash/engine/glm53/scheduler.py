@@ -185,6 +185,7 @@ class Scheduler:
         self._t_step = None
         self.thread = None
         self.steps = 0
+        self._admission_caches = None  # temporary cache ownership until a stream takes it
 
     # ---- client side
     def try_submit(self, req: Request):
@@ -234,11 +235,15 @@ class Scheduler:
             if self.thread.is_alive():
                 self.log(f"scheduler did not stop within {timeout:.0f}s; retaining caches until worker exits")
                 return False
-        for ctx in self.live.values():
-            self._free_set(ctx["caches"])
-        for stream in self.active:
-            self._free_set(stream.caches)
-        self.live.clear(); self.active.clear(); self._toks = self._pos = None
+        # The worker is gone, but an image handler can still own TPU_JAX_LOCK.
+        # Serialize Array.delete with it and complete active clients before freeing.
+        with self.engine_lock:
+            for stream in list(self.active):
+                stream.req.error = RuntimeError("scheduler is shutting down")
+                self._finish(stream, "shutdown", keep=False)
+            for ctx in self.live.values():
+                self._free_set(ctx["caches"])
+            self.live.clear(); self._toks = self._pos = None
         return True
 
     @staticmethod
@@ -369,6 +374,18 @@ class Scheduler:
         return logits, caches, pos
 
     def _admit(self, req):
+        """Admit with transactional cache ownership: exceptional paths free temporary sets."""
+        self._admission_caches = None
+        try:
+            self._admit_impl(req)
+        except Exception:
+            if self._admission_caches is not None:
+                self._free_set(self._admission_caches)
+            raise
+        finally:
+            self._admission_caches = None
+
+    def _admit_impl(self, req):
         prompt = req.prompt
         t0 = time.time()
         st = self.state
@@ -388,8 +405,10 @@ class Scheduler:
             st["prefix_tokens_reused"] = st.get("prefix_tokens_reused", 0) + k
             if k == len(prompt):
                 logits, caches, pos = ctx["logits"], ctx["caches"], ctx["pos"]
+                self._admission_caches = caches
             else:
                 logits, caches, pos = self._prefill(req, k, len(prompt), ctx["caches"], ctx["pos"])
+                self._admission_caches = caches
             req.reused = k
         else:
             self._make_room()
@@ -397,20 +416,25 @@ class Scheduler:
             if k > 0:                                                    # 2. a parked context the prompt extends
                 st["prefix_tokens_reused"] = st.get("prefix_tokens_reused", 0) + k
                 caches = self.snaps.restore(entry)
+                self._admission_caches = caches
                 if k == len(prompt):
                     logits, pos = entry["logits"], entry["n"]
                 else:
                     logits, caches, pos = self._prefill(req, k, len(prompt), caches, entry["n"])
+                    self._admission_caches = caches
                 req.reused = k
             else:                                                        # 3. from scratch (pin the system section)
                 fed = list(prompt)
                 n_sys = self.system_end(prompt)
                 if n_sys >= self.base_min and n_sys < len(prompt):
                     _, caches, pos = self._prefill(req, 0, n_sys, None, 0)
+                    self._admission_caches = caches
                     self.snaps.park(prompt[:n_sys], caches, pos, None, pinned=True)
                     logits, caches, pos = self._prefill(req, n_sys, len(prompt), caches, pos)
+                    self._admission_caches = caches
                 else:
                     logits, caches, pos = self._prefill(req, 0, len(prompt), None, 0)
+                    self._admission_caches = caches
         jax.block_until_ready(logits)
         self._t_step = None
         req.prefill_s = time.time() - t0
