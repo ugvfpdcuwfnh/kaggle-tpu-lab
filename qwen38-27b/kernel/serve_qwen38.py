@@ -313,16 +313,36 @@ def server_death_report(max_lines=60):
     return cause, joined, hint
 
 
-def stop_tunnel(proc):
-    """Best-effort cleanup for a cloudflared child process."""
+def stop_process_group(proc, name="child", term_timeout=20, kill_timeout=10):
+    """Stop a managed child and every descendant: TERM, bounded wait, then KILL.
+
+    launch_server and cloudflared each create a session, so killing the group cannot
+    leave TPU workers or tunnel helpers behind when startup raises or times out.
+    """
     if proc is None or proc.poll() is not None:
         return
-    proc.terminate()
     try:
-        proc.wait(timeout=10)
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=term_timeout)
+        return
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        log(f"   {name} did not exit after SIGTERM; sending SIGKILL to its process group")
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=kill_timeout)
+    except subprocess.TimeoutExpired:
+        log(f"   {name} process group still did not reap after SIGKILL")
+
+
+def stop_tunnel(proc):
+    """Best-effort cleanup for a cloudflared process group."""
+    stop_process_group(proc, "cloudflared", term_timeout=10, kill_timeout=5)
 
 
 def server_died(server, phase, **extra):
@@ -551,7 +571,7 @@ def launch_server(cfg):
             text_only=cfg["text_only"], min_token_bucket=cfg["min_token_bucket"])
     tail = collections.deque(maxlen=200)
     p = subprocess.Popen(server_args(cfg), stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
+                         stderr=subprocess.STDOUT, text=True, env=os.environ.copy(), start_new_session=True)
     tr = make_translator()
 
     def pump():
@@ -593,14 +613,9 @@ def wait_healthy(server, cfg, expect_min):
 
 
 def stop_server(p):
-    if p.poll() is None:
-        p.terminate()
-        try:
-            p.wait(timeout=90)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait(timeout=30)
-    time.sleep(10)  # let the TPU runtime free the chips
+    stop_process_group(p, "vLLM", term_timeout=90, kill_timeout=30)
+    if p is not None:
+        time.sleep(10)  # let the TPU runtime free the chips
 
 
 def completion(cfg, prompt, max_tokens, stream=False, timeout=900):
@@ -807,130 +822,137 @@ if CFG["build_bundle"]:
     sys.exit(0)
 
 # ---------------- 4. launch ----------------
-expect_min = (10 if n_entries else 20) + (0 if CFG["text_only"] else (10 if n_entries else 15))
-if CFG["fast_start"]:
-    expect_min = 5 if n_entries else 7
-    if not n_entries:
-        log("   fast_start without a compile cache: every new request shape will compile "
-            "cold (~1 min each) — attach the env dataset for this mode to make sense")
-banner(4, "Starting vLLM", f"TP=8, ctx {CFG['max_model_len']}, {CFG['max_num_seqs']} seqs, "
-       f"MTP k={CFG['mtp_tokens']}, {'text-only' if CFG['text_only'] else 'multimodal'}")
-log(f"   expect ~{expect_min} min; progress lines below, full vLLM log in {RAW_LOG}")
-server = launch_server(CFG)
-
-# ---------------- 5. tunnel (in parallel with the server start) ----------------
-banner(5, "Public URL")
-url = None
+# This top-level finally covers health timeout, self-test errors and normal expiry.
+server = None
 tunnel = None
-for _ in range(60):  # cloudflared download runs in the background from step 1
-    if CLOUDFLARED.exists():
-        break
-    time.sleep(2)
-if CLOUDFLARED.exists():
-    # Kaggle often blocks UDP/QUIC egress. Try the default protocol first,
-    # then HTTP/2, instead of pinning the tunnel to QUIC and losing the public
-    # endpoint while the local model continues to serve.
-    # cloudflared writes the URL to stdout/stderr. Keep the complete output:
-    # the old code only emitted ``tunnel-failed`` and threw away the evidence
-    # needed to distinguish DNS, egress, and protocol failures.
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com(?:/[^\s]*)?", re.I)
-    tunnel_attempts = []
-    for protocol in (None, "http2", "quic"):
-        lines = []
-        cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://localhost:{PORT}",
-               "--no-autoupdate"]
-        if protocol:
-            cmd += ["--protocol", protocol]
-        log(f"   starting cloudflared ({protocol or 'default'}): {' '.join(cmd)}")
-        try:
-            tunnel = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, text=True)
-        except OSError as e:
-            tunnel_attempts.append({"protocol": protocol or "default", "returncode": None,
-                                    "error": f"{type(e).__name__}: {e}"})
-            log(f"   cloudflared ({protocol or 'default'}) could not start: {e}")
-            continue
+try:
 
-        def pump_cf(proc=tunnel, output=lines):
-            for line in proc.stdout:
-                output.append(line.rstrip())
-                _raw.write(f"[cloudflared] {line}")
-        cf_reader = threading.Thread(target=pump_cf, daemon=True)
-        cf_reader.start()
-        deadline = time.time() + 60
-        while time.time() < deadline and url is None and tunnel.poll() is None:
-            for ln in lines:
-                m = pat.search(ln)
-                if m:
-                    url = m.group(0).rstrip("/")
-                    break
-            time.sleep(1)
-        if url:
-            tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.poll(),
-                                    "output_tail": lines[-8:]})
+    expect_min = (10 if n_entries else 20) + (0 if CFG["text_only"] else (10 if n_entries else 15))
+    if CFG["fast_start"]:
+        expect_min = 5 if n_entries else 7
+        if not n_entries:
+            log("   fast_start without a compile cache: every new request shape will compile "
+                "cold (~1 min each) — attach the env dataset for this mode to make sense")
+    banner(4, "Starting vLLM", f"TP=8, ctx {CFG['max_model_len']}, {CFG['max_num_seqs']} seqs, "
+           f"MTP k={CFG['mtp_tokens']}, {'text-only' if CFG['text_only'] else 'multimodal'}")
+    log(f"   expect ~{expect_min} min; progress lines below, full vLLM log in {RAW_LOG}")
+    server = launch_server(CFG)
+
+    # ---------------- 5. tunnel (in parallel with the server start) ----------------
+    banner(5, "Public URL")
+    url = None
+    tunnel = None
+    for _ in range(60):  # cloudflared download runs in the background from step 1
+        if CLOUDFLARED.exists():
             break
-        if tunnel.poll() is None:
-            tunnel.terminate()
+        time.sleep(2)
+    if CLOUDFLARED.exists():
+        # Kaggle often blocks UDP/QUIC egress. Try the default protocol first,
+        # then HTTP/2, instead of pinning the tunnel to QUIC and losing the public
+        # endpoint while the local model continues to serve.
+        # cloudflared writes the URL to stdout/stderr. Keep the complete output:
+        # the old code only emitted ``tunnel-failed`` and threw away the evidence
+        # needed to distinguish DNS, egress, and protocol failures.
+        pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com(?:/[^\s]*)?", re.I)
+        tunnel_attempts = []
+        for protocol in (None, "http2", "quic"):
+            lines = []
+            cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://localhost:{PORT}",
+                   "--no-autoupdate"]
+            if protocol:
+                cmd += ["--protocol", protocol]
+            log(f"   starting cloudflared ({protocol or 'default'}): {' '.join(cmd)}")
             try:
-                tunnel.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                tunnel.kill()
-                tunnel.wait(timeout=5)
-        cf_reader.join(timeout=2)
-        tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.returncode,
-                                "output_tail": lines[-12:]})
-        if lines:
-            log(f"   cloudflared ({protocol or 'default'}) output:")
-            for ln in lines[-12:]:
-                log(f"     {ln}")
-    if url:
-        log(f"   your endpoint will be  {url}/v1")
-        log("   (not live yet — it answers 502 until the READY banner below)")
-        publish("tunnel-url", endpoint=f"{url}/v1")
-else:
-    publish("tunnel-failed", note="server still reachable inside the kernel on :8000",
-            attempts=tunnel_attempts if CLOUDFLARED.exists() else [{"error": "cloudflared binary unavailable"}])
+                tunnel = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            except OSError as e:
+                tunnel_attempts.append({"protocol": protocol or "default", "returncode": None,
+                                        "error": f"{type(e).__name__}: {e}"})
+                log(f"   cloudflared ({protocol or 'default'}) could not start: {e}")
+                continue
 
-# ---------------- 6. wait, announce, self-test, keep alive ----------------
-startup = wait_healthy(server, CFG, expect_min)
-publish("serving", startup_secs=startup)
-log("")
-log("#" * 70)
-log(f"#  READY — the server is live ({elapsed()} after start)")
-log(f"#  ENDPOINT : {url + '/v1' if url else 'http://127.0.0.1:8000/v1 (tunnel failed)'}")
-log(f"#  API KEY  : {CFG['api_key']}")
-log(f"#  MODEL    : {CFG['served_model_name']}   (context {CFG['max_model_len']}, "
-    f"{CFG['max_num_seqs']} parallel requests)")
-log("#" * 70)
-log("#  Try it:")
-log(f"#    curl {url + '/v1' if url else 'http://127.0.0.1:8000/v1'}/chat/completions \\")
-log("#      -H 'Authorization: Bearer <API_KEY>' -H 'Content-Type: application/json' \\")
-log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": [{\"role\": \"user\", "
-    "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
-log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
-log("#" * 70)
-publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
-        model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
-        keepalive_min=CFG["keepalive_min"], startup_secs=startup)
+            def pump_cf(proc=tunnel, output=lines):
+                for line in proc.stdout:
+                    output.append(line.rstrip())
+                    _raw.write(f"[cloudflared] {line}")
+            cf_reader = threading.Thread(target=pump_cf, daemon=True)
+            cf_reader.start()
+            deadline = time.time() + 60
+            while time.time() < deadline and url is None and tunnel.poll() is None:
+                for ln in lines:
+                    m = pat.search(ln)
+                    if m:
+                        url = m.group(0).rstrip("/")
+                        break
+                time.sleep(1)
+            if url:
+                tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.poll(),
+                                        "output_tail": lines[-8:]})
+                break
+            if tunnel.poll() is None:
+                tunnel.terminate()
+                try:
+                    tunnel.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    tunnel.kill()
+                    tunnel.wait(timeout=5)
+            cf_reader.join(timeout=2)
+            tunnel_attempts.append({"protocol": protocol or "default", "returncode": tunnel.returncode,
+                                    "output_tail": lines[-12:]})
+            if lines:
+                log(f"   cloudflared ({protocol or 'default'}) output:")
+                for ln in lines[-12:]:
+                    log(f"     {ln}")
+        if url:
+            log(f"   your endpoint will be  {url}/v1")
+            log("   (not live yet — it answers 502 until the READY banner below)")
+            publish("tunnel-url", endpoint=f"{url}/v1")
+    else:
+        publish("tunnel-failed", note="server still reachable inside the kernel on :8000",
+                attempts=tunnel_attempts if CLOUDFLARED.exists() else [{"error": "cloudflared binary unavailable"}])
 
-if CFG["fast_start"]:
-    banner(6, "Warm-up", "loading the common request shapes; the endpoint is usable meanwhile")
-    log("   (fast_start: a request with a new shape waits ~1 min the first time)")
-    exercise(CFG)
-else:
-    banner(6, "Self-test", "one short generation; the endpoint is usable meanwhile")
-self_test(CFG)
+    # ---------------- 6. wait, announce, self-test, keep alive ----------------
+    startup = wait_healthy(server, CFG, expect_min)
+    publish("serving", startup_secs=startup)
+    log("")
+    log("#" * 70)
+    log(f"#  READY — the server is live ({elapsed()} after start)")
+    log(f"#  ENDPOINT : {url + '/v1' if url else 'http://127.0.0.1:8000/v1 (tunnel failed)'}")
+    log(f"#  API KEY  : {CFG['api_key']}")
+    log(f"#  MODEL    : {CFG['served_model_name']}   (context {CFG['max_model_len']}, "
+        f"{CFG['max_num_seqs']} parallel requests)")
+    log("#" * 70)
+    log("#  Try it:")
+    log(f"#    curl {url + '/v1' if url else 'http://127.0.0.1:8000/v1'}/chat/completions \\")
+    log("#      -H 'Authorization: Bearer <API_KEY>' -H 'Content-Type: application/json' \\")
+    log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": [{\"role\": \"user\", "
+        "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
+    log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
+    log("#" * 70)
+    publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+            model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
+            keepalive_min=CFG["keepalive_min"], startup_secs=startup)
 
-t_serve = time.time()
-while time.time() - t_serve < CFG["keepalive_min"] * 60:
-    time.sleep(120)
-    if server.poll() is not None:
-        server_died(server, "stopped", reason="server-exit")
-    up = int((time.time() - t_serve) / 60)
-    if up % 10 < 2:
-        publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None))
-        log(f"   still serving ({up} min) — {url + '/v1' if url else ''}")
-publish("auto-shutdown", served_min=CFG["keepalive_min"])
-stop_tunnel(tunnel)
-server.terminate()
-sys.exit(0)
+    if CFG["fast_start"]:
+        banner(6, "Warm-up", "loading the common request shapes; the endpoint is usable meanwhile")
+        log("   (fast_start: a request with a new shape waits ~1 min the first time)")
+        exercise(CFG)
+    else:
+        banner(6, "Self-test", "one short generation; the endpoint is usable meanwhile")
+    self_test(CFG)
+
+    t_serve = time.time()
+    while time.time() - t_serve < CFG["keepalive_min"] * 60:
+        time.sleep(120)
+        if server.poll() is not None:
+            server_died(server, "stopped", reason="server-exit")
+        up = int((time.time() - t_serve) / 60)
+        if up % 10 < 2:
+            publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None))
+            log(f"   still serving ({up} min) — {url + '/v1' if url else ''}")
+    publish("auto-shutdown", served_min=CFG["keepalive_min"])
+    sys.exit(0)
+finally:
+    # Variables may be unset when an early launch/tunnel error occurs.
+    stop_tunnel(tunnel)
+    stop_server(server)
